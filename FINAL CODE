@@ -1,0 +1,799 @@
+# ======================================================================
+# CELL 1 — SPARK + SPARK WEB UI (SEPARATE URL)
+# ======================================================================
+
+!apt-get install -qq openjdk-11-jdk-headless > /dev/null
+!pip install -q pyspark pyngrok pandas numpy
+
+from pyngrok import ngrok
+from pyspark.sql import SparkSession
+import pandas as pd
+import numpy as np
+import time
+import os
+
+# --- NGROK TOKEN ---
+NGROK_AUTH_TOKEN = "34Bpe1FtHprwnWP5x5YsTjSg3UE_6u85pWiF97hn42WptTX2F"   # <<< replace
+ngrok.set_auth_token(NGROK_AUTH_TOKEN)
+
+# --- CREATE SPARK EVENT LOG DIRECTORY ---
+os.makedirs("/tmp/spark-events", exist_ok=True)
+
+# --- START SPARK ---
+spark = SparkSession.builder \
+    .appName("Ecommerce_Spark_UI") \
+    .master("local[8]") \
+    .config("spark.eventLog.enabled","true") \
+    .config("spark.eventLog.dir","/tmp/spark-events") \
+    .config("spark.sql.shuffle.partitions","200") \
+    .config("spark.executor.memory","2g") \
+    .config("spark.driver.memory","2g") \
+    .getOrCreate()
+
+sc = spark.sparkContext
+print("✔ Spark Started:", spark.version)
+
+# --- SPARK UI TUNNEL ---
+spark_ui_url = ngrok.connect(4040)
+print("🌐 SPARK WEB UI:", spark_ui_url)
+
+# --- LOAD DATASET ---
+DATA_PATH = "/content/ecommerce_recommendation_dataset_large.csv"
+df_raw = spark.read.csv(DATA_PATH, header=True, inferSchema=True)
+print("📁 Dataset Loaded")
+df_raw.show(5)
+
+# --- HEAVY JOBS TO FILL SPARK UI ---
+print("\n⚙ Heavy RDD Job...")
+rdd = sc.parallelize(range(3_000_000), 300)
+rdd_out = rdd.map(lambda x: (x % 1000, x)) \
+             .reduceByKey(lambda a,b: a+b).collect()
+
+print("RDD job done — check SPARK UI")
+
+print("\n⚙ SQL Shuffle Job...")
+
+pdf = pd.DataFrame({
+    "user_id": np.random.randint(1,50000,2_000_000),
+    "product_id": np.random.randint(1,10000,2_000_000),
+    "rating": np.random.randint(1,6,2_000_000)
+})
+
+df2 = spark.createDataFrame(pdf)
+df2.createOrReplaceTempView("ratings2")
+
+spark.sql("""
+    SELECT product_id, AVG(rating) AS avg_rating, COUNT(*) AS users
+    FROM ratings2 GROUP BY product_id ORDER BY users DESC
+""").show(10)
+
+print("SQL job done — check Stages / Executors / Timeline in Spark UI")
+# KILL ALL EXISTING NGROK TUNNELS
+!pkill -f ngrok
+!killall ngrok
+print("✅ All ngrok processes killed successfully!")
+!pip install -q gradio pandas numpy matplotlib scikit-learn
+
+import gradio as gr
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics.pairwise import cosine_similarity
+
+# ============================================================
+# 1. LOAD DATASET
+# ============================================================
+DATASET_PATH = "/content/ecommerce_recommendation_dataset_large.csv"  # change if needed
+
+df_raw = pd.read_csv(DATASET_PATH)
+
+def detect_col(cols, keywords, default=None):
+    for c in cols:
+        cl = c.lower()
+        if any(k in cl for k in keywords):
+            return c
+    return default
+
+cols = list(df_raw.columns)
+
+product_col = detect_col(cols, ["product", "item", "pid"], None)
+user_col    = detect_col(cols, ["user", "customer", "uid"], None)
+rating_col  = detect_col(cols, ["rating", "score", "stars"], None)
+brand_col   = detect_col(cols, ["brand", "category"], None)
+name_col    = detect_col(cols, ["name", "title"], product_col)
+price_col   = detect_col(cols, ["price", "cost", "amount", "mrp"], None)
+
+if not (product_col and user_col and rating_col):
+    raise ValueError(
+        f"Could not detect main columns. "
+        f"product={product_col}, user={user_col}, rating={rating_col}"
+    )
+
+df = df_raw.copy()
+df = df.rename(columns={
+    product_col: "product_id",
+    user_col: "user_id",
+    rating_col: "rating",
+    (brand_col or "brand"): "brand",
+    (name_col or product_col): "product_name",
+    (price_col or "price"): "price"
+})
+
+df["product_id"] = df["product_id"].astype(str)
+df["user_id"]    = df["user_id"].astype(str)
+df["rating"]     = pd.to_numeric(df["rating"], errors="coerce").fillna(0)
+if "price" in df.columns:
+    df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(0)
+else:
+    df["price"] = 0.0
+if "brand" not in df.columns:
+    df["brand"] = "Unknown"
+
+# Small subset for model
+df_small = df[["user_id", "product_id", "rating"]].dropna()
+if df_small["product_id"].nunique() > 900:
+    sample_products = df_small["product_id"].drop_duplicates().sample(900, random_state=42)
+    df_small = df_small[df_small["product_id"].isin(sample_products)]
+
+pivot = df_small.pivot_table(index="product_id", columns="user_id", values="rating").fillna(0)
+similarity = cosine_similarity(pivot.values)
+sim_df = pd.DataFrame(similarity, index=pivot.index, columns=pivot.index)
+
+prod_info = df[["product_id", "product_name", "brand", "price"]].drop_duplicates("product_id")
+avg_rating_map = df.groupby("product_id")["rating"].mean().to_dict()
+
+agg = df.groupby("product_id")["rating"].agg(["count", "mean"]).reset_index()
+agg = agg.sort_values("count", ascending=False).head(20)
+trending = agg.merge(prod_info, on="product_id", how="left")
+
+brand_stats = df.groupby("brand")["rating"].agg(["count", "mean"]).reset_index()
+
+# ============================================================
+# 2. HTML PRODUCT CARDS
+# ============================================================
+def make_cards(rows: pd.DataFrame, title: str = "") -> str:
+    if rows is None or len(rows) == 0:
+        return "<p style='padding:10px;'>No products to display.</p>"
+
+    html = f"""
+    <div class="bw-shell fade-in">
+      <h3 style="margin-top:16px;margin-bottom:6px;color:#e5e7eb;">{title or "Products"}</h3>
+      <div class="bw-grid">
+    """
+
+    for _, r in rows.iterrows():
+        pid = r.get("product_id", "")
+        name = r.get("product_name", "")
+        brand = r.get("brand", "Unknown")
+        price = r.get("price", 0.0)
+        rating = avg_rating_map.get(pid, 0.0)
+        img = f"https://picsum.photos/seed/{pid}/400/260"
+
+        stars = "⭐" * int(round(rating)) if rating > 0 else "☆"
+        html += f"""
+        <div class="bw-card">
+          <div class="bw-img-wrap">
+            <img src="{img}" alt="{name}">
+          </div>
+          <div class="bw-card-body">
+            <div class="bw-name" title="{name}">{name}</div>
+            <div class="bw-brand">{brand}</div>
+            <div class="bw-rating">{stars} <span>{rating:.1f}</span></div>
+            <div class="bw-price">₹{price:.2f}</div>
+            <div class="bw-meta">ID: {pid}</div>
+          </div>
+        </div>
+        """
+
+    html += "</div></div>"
+    return html
+
+# ============================================================
+# 3. LOGIC FUNCTIONS
+# ============================================================
+def login(username, password, logged_state, role_state):
+    if username == "bloom" and password == "wings123":
+        return "✅ Logged in as USER.", True, "user"
+    if username == "admin" and password == "admin123":
+        return "✅ Logged in as ADMIN.", True, "admin"
+    return "❌ Invalid username or password.", logged_state, role_state
+
+def get_trending_ui():
+    rows = trending.merge(prod_info, on="product_id", how="left")
+    rows = rows[["product_id", "product_name", "brand", "price"]].drop_duplicates("product_id").head(12)
+    return make_cards(rows, "Today's Trending Products")
+
+def browse_category(brand_name):
+    if not brand_name or brand_name == "All":
+        return get_trending_ui()
+    rows = prod_info[prod_info["brand"] == brand_name].head(12)
+    return make_cards(rows, f"Top picks from {brand_name}")
+
+def recommend_ui(pid_input, brand_filter, logged_state, role_state, cart_state):
+    pid = str(pid_input).strip()
+    if not logged_state:
+        return "⚠️ Please login first.", "", None, None, cart_state
+    if pid == "":
+        return "Enter a product ID.", "", None, None, cart_state
+    if pid not in sim_df.index:
+        return f"❌ Product {pid} not found in model.", "", None, None, cart_state
+
+    sims = sim_df.loc[pid].sort_values(ascending=False)[1:13]
+    rec_ids = list(sims.index)
+    rec_rows = prod_info[prod_info["product_id"].isin(rec_ids)].copy()
+    if brand_filter and brand_filter != "All":
+        rec_rows = rec_rows[rec_rows["brand"] == brand_filter]
+
+    brand_counts = rec_rows["brand"].value_counts()
+    fig_brand = None
+    if not brand_counts.empty:
+        fig_brand, ax = plt.subplots(figsize=(4, 3))
+        ax.bar(brand_counts.index.astype(str), brand_counts.values, color="#2563eb")
+        ax.set_title("Brand Distribution")
+        ax.tick_params(axis="x", rotation=45)
+        plt.tight_layout()
+
+    ratings = df[df["product_id"].isin(rec_rows["product_id"].tolist())]["rating"].values
+    fig_rating = None
+    if len(ratings) > 0:
+        fig_rating, ax2 = plt.subplots(figsize=(4, 3))
+        ax2.hist(ratings, bins=5, color="#16a34a")
+        ax2.set_title("Rating Distribution")
+        ax2.set_xlabel("Rating")
+        ax2.set_ylabel("Frequency")
+        plt.tight_layout()
+
+    cards_html = make_cards(rec_rows, f"Recommendations for {pid}")
+    msg = f"🎯 Found {len(rec_rows)} similar products for **{pid}**"
+    return msg, cards_html, fig_brand, fig_rating, cart_state
+
+def search_suggestions(query):
+    q = str(query).strip().lower()
+    if not q:
+        return gr.update(choices=[])
+    sub = prod_info[
+        prod_info["product_id"].str.lower().str.contains(q) |
+        prod_info["product_name"].str.lower().str.contains(q)
+    ]
+    opts = (sub["product_id"] + " | " + sub["product_name"]).head(15).tolist()
+    return gr.update(choices=opts)
+
+def search_ui(selected, brand_filter, logged_state, role_state):
+    if not logged_state:
+        return "⚠️ Please login first.", ""
+    if not selected:
+        return "Enter text or pick from suggestions.", ""
+    pid = selected.split("|")[0].strip()
+    rows = prod_info[prod_info["product_id"] == pid]
+    if brand_filter and brand_filter != "All":
+        rows = rows[rows["brand"] == brand_filter]
+    return f"🔍 Details for **{pid}**", make_cards(rows, "Search Result")
+
+def add_to_cart(pid_input, cart_state, logged_state):
+    if not logged_state:
+        return "⚠️ Please login first to add to cart.", cart_state, "🛒 0"
+    pid = str(pid_input).strip()
+    if pid == "":
+        return "Enter a Product ID.", cart_state, f"🛒 {len(cart_state or [])}"
+    if pid not in prod_info["product_id"].values:
+        return f"❌ Product {pid} not found.", cart_state, f"🛒 {len(cart_state or [])}"
+    cart_state = list(cart_state) if cart_state else []
+    cart_state.append(pid)
+    return f"✅ Added {pid} to cart.", cart_state, f"🛒 {len(cart_state)}"
+
+def cart_summary(cart_state, logged_state):
+    if not logged_state:
+        return "⚠️ Login to view cart.", "<p>Cart is empty.</p>"
+    if not cart_state:
+        return "🧺 Cart is empty.", "<p>No items in cart.</p>"
+    ids = [str(x) for x in cart_state]
+    rows = prod_info[prod_info["product_id"].isin(ids)]
+    total = rows["price"].sum()
+    cards_html = make_cards(rows, "Items in Your Cart")
+    msg = f"🧺 {len(rows)} items | Total: ₹{total:.2f}"
+    return msg, cards_html
+
+def admin_dashboard(logged_state, role_state):
+    if not logged_state or role_state != "admin":
+        return None, None, "⚠️ Admin only. Login as admin / admin123."
+    fig1, ax1 = plt.subplots(figsize=(5, 3))
+    ax1.bar(brand_stats["brand"].astype(str), brand_stats["count"], color="#2563eb")
+    ax1.set_title("Ratings Count per Brand")
+    ax1.tick_params(axis="x", rotation=45)
+    plt.tight_layout()
+    fig2, ax2 = plt.subplots(figsize=(5, 3))
+    ax2.bar(brand_stats["brand"].astype(str), brand_stats["mean"], color="#f97316")
+    ax2.set_title("Average Rating per Brand")
+    ax2.tick_params(axis="x", rotation=45)
+    plt.tight_layout()
+    return fig1, fig2, "📊 Admin dashboard loaded."
+
+def detail_view(pid):
+    pid = str(pid).strip()
+    if not pid:
+        return "<p>Enter a Product ID above.</p>"
+    rows = prod_info[prod_info["product_id"] == pid]
+    if rows.empty:
+        return f"<p>Product {pid} not found.</p>"
+    r = rows.iloc[0]
+    rating = avg_rating_map.get(pid, 0.0)
+    stars = "⭐" * int(round(rating)) if rating > 0 else "☆"
+    img = f"https://picsum.photos/seed/detail{pid}/600/360"
+    html = f"""
+    <div class="bw-detail-backdrop fade-in">
+      <div class="bw-detail-card">
+        <div class="bw-detail-left">
+          <img src="{img}" alt="{r['product_name']}">
+        </div>
+        <div class="bw-detail-right">
+          <h2>{r['product_name']}</h2>
+          <p><b>Product ID:</b> {pid}</p>
+          <p><b>Brand:</b> {r['brand']}</p>
+          <p><b>Price:</b> ₹{r['price']:.2f}</p>
+          <p><b>Rating:</b> {stars} ({rating:.1f})</p>
+          <p style="font-size:13px;color:#9ca3af;">Smart recommended item from BloomWings dataset.</p>
+        </div>
+      </div>
+    </div>
+    """
+    return html
+
+def nav_switch(page):
+    return (
+        gr.update(visible=(page=="Home")),
+        gr.update(visible=(page=="Recommendations")),
+        gr.update(visible=(page=="Search")),
+        gr.update(visible=(page=="Cart")),
+        gr.update(visible=(page=="Admin"))
+    )
+
+# ============================================================
+# 4. CSS WITH SOFT ELEGANT ANIMATIONS
+# ============================================================
+BRANDS = ["All"] + sorted(list(prod_info["brand"].dropna().unique()))
+
+custom_css = """
+body { background:#020617; }
+main { background:#020617; }
+
+.fade-in {
+  animation: fadeIn 0.5s ease-out;
+}
+@keyframes fadeIn {
+  from { opacity:0; transform:translateY(4px); }
+  to { opacity:1; transform:translateY(0); }
+}
+
+.bw-shell {
+  max-width: 1180px;
+  margin: 0 auto;
+  font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+}
+
+/* Navbar */
+.bw-navbar-wrap {
+  display:flex;
+  justify-content:center;
+  margin-top:8px;
+}
+.bw-navbar {
+  background: linear-gradient(90deg,#1d4ed8,#1e40af);
+  color:white;
+  padding:10px 32px;
+  border-radius:0 0 22px 22px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  width:100%;
+  max-width:1180px;
+  box-shadow:0 10px 30px rgba(15,23,42,0.7);
+}
+.bw-logo { display:flex; align-items:center; gap:8px; }
+.bw-logo-mark {
+  width:34px;height:34px;border-radius:9999px;
+  background:white;color:#1d4ed8;
+  font-weight:800;font-size:18px;
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 6px 15px rgba(15,23,42,0.3);
+}
+.bw-logo-text-main { font-weight:700;font-size:18px; }
+.bw-logo-text-sub { font-size:11px;opacity:0.85; }
+
+.bw-nav-links {
+  display:flex;gap:24px;font-size:13px;position:relative;
+}
+.bw-nav-links span {
+  cursor:pointer;
+  position:relative;
+}
+.bw-nav-links span::after {
+  content:"";
+  position:absolute;
+  left:0;bottom:-3px;
+  width:0;height:2px;
+  background:#bfdbfe;
+  transition:width 0.25s ease-out;
+}
+.bw-nav-links span:hover::after {
+  width:100%;
+}
+
+/* Hero row - animated slider feel */
+.bw-hero-row {
+  margin-top:16px;
+  display:grid;
+  grid-template-columns:2fr 1fr 1fr;
+  gap:12px;
+}
+.bw-hero-main {
+  border-radius:18px;
+  min-height:170px;
+  position:relative;
+  overflow:hidden;
+}
+.bw-hero-main-slider {
+  position:absolute;inset:0;
+  animation: heroSlider 12s infinite ease-in-out;
+  background-size:cover;
+  background-position:center;
+}
+@keyframes heroSlider {
+  0%   { background-image:url('https://picsum.photos/seed/bwslide1/900/300'); }
+  33%  { background-image:url('https://picsum.photos/seed/bwslide2/900/300'); }
+  66%  { background-image:url('https://picsum.photos/seed/bwslide3/900/300'); }
+  100% { background-image:url('https://picsum.photos/seed/bwslide1/900/300'); }
+}
+.bw-hero-main-overlay {
+  position:absolute;inset:0;
+  background:linear-gradient(90deg,rgba(15,23,42,0.75),transparent);
+}
+.bw-hero-main-text {
+  position:absolute;left:20px;top:20px;
+  color:white;
+}
+.bw-hero-main-title { font-size:22px;font-weight:700; }
+.bw-hero-main-sub { font-size:13px;margin-top:4px; }
+
+.bw-hero-side {
+  border-radius:18px;
+  background-size:cover;
+  background-position:center;
+  min-height:170px;
+  position:relative;
+  overflow:hidden;
+  transform:scale(1);
+  transition:transform 0.3s ease-out, box-shadow 0.3s ease-out;
+}
+.bw-hero-side:hover {
+  transform:scale(1.02);
+  box-shadow:0 10px 25px rgba(15,23,42,0.6);
+}
+.bw-hero-tag {
+  position:absolute;bottom:8px;left:10px;
+  background:rgba(15,23,42,0.85);
+  color:white;font-size:12px;
+  padding:4px 8px;border-radius:999px;
+}
+
+/* Category row */
+.bw-cat-row {
+  display:flex;
+  gap:10px;
+  margin-top:16px;
+  overflow-x:auto;
+}
+.bw-cat-pill {
+  min-width:120px;
+  padding:8px 10px;
+  border-radius:999px;
+  background:rgba(15,23,42,0.9);
+  color:#e5e7eb;
+  font-size:12px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  border:1px solid rgba(148,163,184,0.4);
+  transition:background 0.25s ease-out, transform 0.25s ease-out, box-shadow 0.25s ease-out;
+}
+.bw-cat-pill:hover {
+  background:#1d4ed8;
+  box-shadow:0 8px 20px rgba(37,99,235,0.5);
+  transform:translateY(-2px);
+}
+
+/* Cards */
+.bw-grid {
+  display:flex;
+  flex-wrap:wrap;
+  gap:14px;
+  margin-top:12px;
+}
+.bw-card {
+  width:210px;
+  background:white;
+  border-radius:16px;
+  box-shadow:0 10px 25px rgba(15,23,42,0.35);
+  overflow:hidden;
+  display:flex;
+  flex-direction:column;
+  transform:translateY(0);
+  transition:transform 0.25s ease-out, box-shadow 0.25s ease-out;
+}
+.bw-card:hover {
+  transform:translateY(-6px);
+  box-shadow:0 18px 40px rgba(15,23,42,0.6);
+}
+.bw-img-wrap img {
+  width:100%;
+  height:150px;
+  object-fit:cover;
+  transition:transform 0.35s ease-out;
+}
+.bw-card:hover .bw-img-wrap img {
+  transform:scale(1.03);
+}
+.bw-card-body { padding:8px 10px 10px 10px; }
+.bw-name {
+  font-weight:600;font-size:14px;color:#0f172a;
+  margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.bw-brand { font-size:12px;color:#4b5563; }
+.bw-rating { font-size:12px;color:#f97316;margin-top:2px; }
+.bw-rating span { color:#4b5563;font-size:11px;margin-left:2px; }
+.bw-price { font-size:14px;color:#16a34a;font-weight:600;margin-top:4px; }
+.bw-meta { font-size:11px;color:#6b7280;margin-top:2px; }
+
+/* Detail popup */
+.bw-detail-backdrop {
+  position:fixed;
+  inset:0;
+  background:rgba(15,23,42,0.85);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  z-index:9999;
+}
+.bw-detail-card {
+  width:720px;
+  background:white;
+  border-radius:20px;
+  padding:14px;
+  display:flex;
+  gap:12px;
+  box-shadow:0 18px 50px rgba(15,23,42,0.8);
+}
+.bw-detail-left img {
+  width:320px;
+  height:260px;
+  object-fit:cover;
+  border-radius:16px;
+}
+.bw-detail-right {
+  flex:1;
+  color:#0f172a;
+  font-size:14px;
+}
+
+/* Floating cart */
+.bw-cart-fab {
+  position:fixed;
+  right:18px;
+  bottom:18px;
+  background:#f97316;
+  color:white;
+  padding:10px 16px;
+  border-radius:999px;
+  font-weight:600;
+  box-shadow:0 12px 30px rgba(15,23,42,0.7);
+  font-size:13px;
+  animation: cartPulse 7s infinite ease-in-out;
+}
+@keyframes cartPulse {
+  0%, 90%, 100% { transform:scale(1); box-shadow:0 12px 30px rgba(15,23,42,0.7); }
+  93% { transform:scale(1.05); box-shadow:0 16px 38px rgba(15,23,42,0.9); }
+}
+
+/* Gradio override some text colors */
+h3, h2, p, label {
+  color:#e5e7eb !important;
+}
+"""
+
+# ============================================================
+# 5. BUILD GRADIO APP
+# ============================================================
+with gr.Blocks(css=custom_css, title="BloomWings E-Commerce") as demo:
+    logged_state = gr.State(False)
+    role_state = gr.State("guest")
+    cart_state = gr.State([])
+    detail_state = gr.State("")
+
+    gr.HTML("""
+    <div class="bw-navbar-wrap">
+      <div class="bw-navbar fade-in">
+        <div class="bw-logo">
+          <div class="bw-logo-mark">BW</div>
+          <div>
+            <div class="bw-logo-text-main">BloomWings</div>
+            <div class="bw-logo-text-sub">Smart E-Commerce Product Recommendation</div>
+          </div>
+        </div>
+        <div class="bw-nav-links">
+          <span>Home</span>
+          <span>Recommendations</span>
+          <span>Search</span>
+          <span>Cart</span>
+          <span>Admin</span>
+        </div>
+      </div>
+    </div>
+    """)
+
+    nav_radio = gr.Radio(
+        choices=["Home","Recommendations","Search","Cart","Admin"],
+        value="Home",
+        show_label=False
+    )
+
+    cart_fab = gr.HTML("<div class='bw-cart-fab'>🛒 0</div>")
+
+    # Login section
+    with gr.Group():
+        gr.HTML("<div class='bw-shell fade-in'>")
+        gr.Markdown("### 🔐 Login (bloom / wings123)  &nbsp;&nbsp;  or  &nbsp;&nbsp;  (admin / admin123)")
+        user_in = gr.Textbox(label="Username")
+        pass_in = gr.Textbox(label="Password", type="password")
+        login_btn = gr.Button("Login", variant="primary")
+        login_msg = gr.Markdown("Not logged in.")
+        gr.HTML("</div>")
+
+    # Pages
+    with gr.Group(visible=True) as home_page:
+        gr.HTML("<div class='bw-shell fade-in'>")
+        gr.HTML("""
+        <div class="bw-hero-row">
+          <div class="bw-hero-main">
+            <div class="bw-hero-main-slider"></div>
+            <div class="bw-hero-main-overlay"></div>
+            <div class="bw-hero-main-text">
+              <div class="bw-hero-main-title">Winter Deals at BloomWings</div>
+              <div class="bw-hero-main-sub">Skincare • Groceries • Fashion • Electronics</div>
+            </div>
+          </div>
+          <div class="bw-hero-side" style="background-image:url('https://picsum.photos/seed/bwside1/400/260');">
+            <div class="bw-hero-tag">Fresh Groceries</div>
+          </div>
+          <div class="bw-hero-side" style="background-image:url('https://picsum.photos/seed/bwside2/400/260');">
+            <div class="bw-hero-tag">Trending Fashion</div>
+          </div>
+        </div>
+        """)
+        gr.Markdown("### 🏷️ Browse by Brand")
+        cat_row = gr.HTML(
+            "<div class='bw-cat-row'>" +
+            "".join([f"<div class='bw-cat-pill'>{b}</div>" for b in BRANDS[:10]]) +
+            "</div>"
+        )
+        cat_select = gr.Dropdown(label="Pick a brand", choices=BRANDS, value="All")
+        home_trending = gr.HTML("")
+        gr.HTML("</div>")
+
+    with gr.Group(visible=False) as rec_page:
+        gr.HTML("<div class='bw-shell fade-in'>")
+        gr.Markdown("### 🎯 Recommendations")
+        with gr.Row():
+            pid_box = gr.Textbox(label="Enter Product ID (e.g., P104)")
+            brand_drop = gr.Dropdown(label="Filter by brand", choices=BRANDS, value="All")
+        rec_btn = gr.Button("Recommend Products", variant="primary")
+        rec_status = gr.Markdown("")
+        rec_cards = gr.HTML("")
+        with gr.Row():
+            brand_plot = gr.Plot(label="Brand Distribution")
+            rating_plot = gr.Plot(label="Rating Distribution")
+        detail_pid = gr.Textbox(label="Open Product Detail (ID)")
+        detail_btn = gr.Button("Show Detail")
+        detail_html = gr.HTML("")
+        gr.HTML("</div>")
+
+    with gr.Group(visible=False) as search_page:
+        gr.HTML("<div class='bw-shell fade-in'>")
+        gr.Markdown("### 🔎 Search with Suggestions")
+        search_box = gr.Textbox(label="Type product id or name")
+        suggestions = gr.Dropdown(label="Suggestions", choices=[], interactive=True)
+        search_brand = gr.Dropdown(label="Brand filter", choices=BRANDS, value="All")
+        search_btn = gr.Button("Search")
+        search_status = gr.Markdown("")
+        search_cards = gr.HTML("")
+        gr.HTML("</div>")
+
+    with gr.Group(visible=False) as cart_page:
+        gr.HTML("<div class='bw-shell fade-in'>")
+        gr.Markdown("### 🧺 Cart")
+        add_pid = gr.Textbox(label="Product ID to add to cart")
+        add_btn = gr.Button("Add to Cart")
+        add_msg = gr.Markdown("")
+        cart_msg = gr.Markdown("")
+        cart_cards = gr.HTML("")
+        gr.HTML("</div>")
+
+    with gr.Group(visible=False) as admin_page:
+        gr.HTML("<div class='bw-shell fade-in'>")
+        gr.Markdown("### 📊 Admin Dashboard")
+        admin_msg = gr.Markdown("")
+        with gr.Row():
+            admin_fig1 = gr.Plot(label="Brand Popularity")
+            admin_fig2 = gr.Plot(label="Average Rating by Brand")
+        gr.HTML("</div>")
+
+    # ---------- WIRING ----------
+    login_btn.click(
+        login,
+        inputs=[user_in, pass_in, logged_state, role_state],
+        outputs=[login_msg, logged_state, role_state]
+    )
+
+    demo.load(
+        lambda: get_trending_ui(),
+        inputs=None,
+        outputs=home_trending
+    )
+
+    cat_select.change(
+        browse_category,
+        inputs=cat_select,
+        outputs=home_trending
+    )
+
+    rec_btn.click(
+        recommend_ui,
+        inputs=[pid_box, brand_drop, logged_state, role_state, cart_state],
+        outputs=[rec_status, rec_cards, brand_plot, rating_plot, cart_state]
+    )
+
+    search_box.change(
+        search_suggestions,
+        inputs=search_box,
+        outputs=suggestions
+    )
+
+    search_btn.click(
+        search_ui,
+        inputs=[suggestions, search_brand, logged_state, role_state],
+        outputs=[search_status, search_cards]
+    )
+
+    add_btn.click(
+        add_to_cart,
+        inputs=[add_pid, cart_state, logged_state],
+        outputs=[add_msg, cart_state, cart_fab]
+    ).then(
+        cart_summary,
+        inputs=[cart_state, logged_state],
+        outputs=[cart_msg, cart_cards]
+    )
+
+    demo.load(
+        cart_summary,
+        inputs=[cart_state, logged_state],
+        outputs=[cart_msg, cart_cards]
+    )
+
+    demo.load(
+        admin_dashboard,
+        inputs=[logged_state, role_state],
+        outputs=[admin_fig1, admin_fig2, admin_msg]
+    )
+
+    detail_btn.click(
+        lambda pid: detail_view(pid),
+        inputs=detail_pid,
+        outputs=detail_html
+    )
+
+    nav_radio.change(
+        nav_switch,
+        inputs=nav_radio,
+        outputs=[home_page, rec_page, search_page, cart_page, admin_page]
+    )
+
+demo.launch(share=True)
